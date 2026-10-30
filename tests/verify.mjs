@@ -1,0 +1,52 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import ts from 'typescript';
+const out=path.resolve('.test-output');fs.mkdirSync(out,{recursive:true});
+function compile(file,name,replacements={}){let text=ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}}).outputText;for(const [from,to]of Object.entries(replacements))text=text.replaceAll(`from "${from}"`,`from "${to}"`);fs.writeFileSync(path.join(out,name),text);}
+compile('lib/tracking.ts','tracking.mjs');compile('lib/seed.ts','seed.mjs');
+compile('lib/store.ts','store.mjs',{'./sqlite':'./mocks.mjs','./seed':'./seed.mjs'});
+for(const [file,name]of [['app/api/entries/route.ts','entries.mjs'],['app/api/entries/[id]/route.ts','entry.mjs'],['app/api/settings/route.ts','settings.mjs']]){const depth=file.includes('[id]')?'../../../':'../../';const libDepth=file.includes('[id]')?'../../../../':'../../../';compile(file,name,{[depth+'local-user']:'./mocks.mjs',[libDepth+'lib/store']:'./store.mjs',[libDepth+'lib/tracking']:'./tracking.mjs',[libDepth+'lib/seed']:'./seed.mjs'});}
+fs.writeFileSync(path.join(out,'mocks.mjs'),`
+import {DatabaseSync} from 'node:sqlite';
+import fs from 'node:fs';
+const sql=new DatabaseSync(':memory:');sql.exec("CREATE TABLE tracker_state(user_id TEXT PRIMARY KEY,initialized_at TEXT);CREATE TABLE work_entries(id TEXT PRIMARY KEY,user_id TEXT,date TEXT,kind TEXT,hours REAL,rate REAL,approximate INTEGER,note TEXT,source_week INTEGER,updated_at TEXT);");
+class Prepared{constructor(query,values=[]){this.query=query;this.values=values}bind(...values){if(values.length>100)throw new Error('D1 parameter limit exceeded');return new Prepared(this.query,values)}async first(){return sql.prepare(this.query).get(...this.values)??null}async all(){return {results:sql.prepare(this.query).all(...this.values)}}async run(){const r=sql.prepare(this.query).run(...this.values);return {success:true,meta:{changes:Number(r.changes)}}}}
+const DB={prepare(query){return new Prepared(query)},async batch(statements){sql.exec('BEGIN');try{const results=[];for(const stmt of statements)results.push(await stmt.run());sql.exec('COMMIT');return results}catch(e){sql.exec('ROLLBACK');throw e}}};
+export const env={DB};export const session={user:{userId:'owner',email:'owner@test.invalid'}};export async function getLocalUser(){return session.user};
+`);
+const {SEED_ENTRIES,ORIGINAL_SUMMARIES}=await import(path.join(out,'seed.mjs'));
+const {aggregate,band,importAudit,summarize,validDate,weekStart,validateEntry}=await import(path.join(out,'tracking.mjs'));
+const {session}=await import(path.join(out,'mocks.mjs'));
+const api=await import(path.join(out,'entries.mjs'));const item=await import(path.join(out,'entry.mjs'));const settings=await import(path.join(out,'settings.mjs'));
+const totals=summarize(SEED_ENTRIES);
+assert.equal(SEED_ENTRIES.length,21);
+assert.equal(totals.worked,43);assert.equal(totals.qualifying,4);assert.equal(totals.unrated,2);assert.equal(totals.earnings,1544);assert.equal(totals.unmeasured,1);
+assert.equal(importAudit(SEED_ENTRIES,ORIGINAL_SUMMARIES).length,1);
+for(const period of ['week','month'])assert.equal(aggregate(SEED_ENTRIES,period,2026,10).reduce((s,g)=>s+g.total,0),44);
+assert.equal(aggregate(SEED_ENTRIES,'year',2026,10).reduce((s,g)=>s+g.total,0),47);
+assert.equal(weekStart('2026-05-02'),'2026-04-26');assert.equal(weekStart('2026-05-03'),'2026-05-03');assert.equal(weekStart('2026-10-12'),'2026-10-11');
+assert.equal(validDate('2026-02-29'),false);assert.equal(validDate('2028-02-29'),true);
+for(const [rate,expected]of [[19.99,'other'],[20,'blue'],[29.99,'blue'],[30,'red'],[49.99,'red'],[50,'yellow'],[60,'yellow'],[null,'blue']])assert.equal(band({...SEED_ENTRIES[0],kind:'work',rate}),expected);
+assert.throws(()=>validateEntry({date:'2026-10-13',kind:'work',hours:2,rate:25.999,note:''}),/two decimal/);
+let res=await api.GET();assert.equal(res.status,200);let data=await res.json();assert.equal(data.entries.length,21);
+res=await api.GET();assert.equal((await res.json()).entries.length,21);
+const req=(method,body,origin='https://work.test')=>new Request('https://work.test/api/entries',{method,headers:{origin,'Content-Type':'application/json'},body:JSON.stringify(body)});
+const entry=(hours,rate,kind='work')=>({date:'2027-01-02',kind,hours,rate,approximate:false,note:'Persistence verification'});
+res=await api.POST(req('POST',{entries:[entry(2,25),entry(.5,null,'qualifying')]}));assert.equal(res.status,201);data=await res.json();assert.equal(data.entries.length,23);
+const added=data.entries.find(e=>e.date==='2027-01-02'&&e.kind==='work');
+res=await item.PATCH(req('PATCH',{entries:[entry(1,20),entry(1,55)]}),{params:Promise.resolve({id:added.id})});assert.equal(res.status,200);data=await res.json();assert.equal(data.entries.length,24);assert.equal(summarize(data.entries.filter(e=>e.date==='2027-01-02')).earnings,75);
+res=await item.PATCH(req('PATCH',{entries:[entry(24,55)]}),{params:Promise.resolve({id:added.id})});assert.equal(res.status,400);
+res=await api.POST(req('POST',{entries:[entry(-2,55)]}));assert.equal(res.status,400);
+res=await api.POST(req('POST',{entries:[entry(2,55)]},'https://untrusted.test'));assert.equal(res.status,403);
+const unknown=data.entries.find(e=>e.date==='2026-10-08');
+res=await settings.PATCH(req('PATCH',{rate:25,ids:[unknown.id]}));assert.equal(res.status,200);data=await res.json();assert.equal(data.updated,1);assert.equal(data.entries.find(e=>e.id===unknown.id).rate,25);
+const ownerId=data.entries[0].id;session.user={userId:'another-user',email:'other@test.invalid'};
+res=await item.PATCH(req('PATCH',{entries:[entry(2,55)]}),{params:Promise.resolve({id:ownerId})});assert.equal(res.status,404);
+res=await item.DELETE(req('DELETE',{}),{params:Promise.resolve({id:ownerId})});assert.equal(res.status,404);
+session.user=null;assert.equal((await api.GET()).status,401);assert.equal((await api.POST(req('POST',{entries:[entry(2,55)]}))).status,401);
+session.user={userId:'owner',email:'owner@test.invalid'};
+res=await item.DELETE(req('DELETE',{}),{params:Promise.resolve({id:unknown.id})});assert.equal(res.status,200);
+res=await api.GET();data=await res.json();assert.equal(data.entries.length,23);assert.equal(data.entries.some(e=>e.id===unknown.id),false,'Deleted import must never be re-seeded');
+assert.equal(aggregate(data.entries,'year',2026,10).find(g=>g.key==='2027').total,2.5);
+console.log('PASS: sample totals, chart periods, rate bands, validation, SQLite save/edit/split/delete/reload, batch rate updates, ownership and origin protection.');
